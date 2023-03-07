@@ -1,0 +1,341 @@
+apiVersion: tekton.dev/v1beta1
+kind: PipelineRun
+metadata:
+  annotations:
+    build.appstudio.redhat.com/commit_sha: '{{revision}}'
+    build.appstudio.redhat.com/target_branch: '{{target_branch}}'
+    pipelinesascode.tekton.dev/max-keep-runs: "3"
+    pipelinesascode.tekton.dev/on-event: '[push]'
+    pipelinesascode.tekton.dev/on-target-branch: '[base-rzsi]'
+  creationTimestamp: null
+  labels:
+    appstudio.openshift.io/application: mvp-test-app
+    appstudio.openshift.io/component: mvp-test-component
+    pipelines.appstudio.openshift.io/type: build
+  name: mvp-test-component-on-push
+  namespace: mvp-demo-dev-namespace-akaj-tenant
+spec:
+  params:
+  - name: dockerfile
+    value: Dockerfile
+  - name: git-url
+    value: '{{repo_url}}'
+  - name: output-image
+    value: quay.io/redhat-appstudio-qe/test-images:{{revision}}
+  - name: path-context
+    value: .
+  - name: revision
+    value: '{{revision}}'
+  pipelineSpec:
+    finally:
+    - name: show-summary
+      params:
+      - name: pipelinerun-name
+        value: $(context.pipelineRun.name)
+      - name: git-url
+        value: $(tasks.clone-repository.results.url)?rev=$(tasks.clone-repository.results.commit)
+      - name: image-url
+        value: $(params.output-image)
+      taskRef:
+        bundle: quay.io/psturc/task-summary:0.1@sha256:77e81e0cdb66c139d428f48d79cf249c6887d08c8dda70564fb50170e0320111
+        name: summary
+    params:
+    - description: Source Repository URL
+      name: git-url
+      type: string
+    - default: ""
+      description: Revision of the Source Repository
+      name: revision
+      type: string
+    - description: Fully Qualified Output Image
+      name: output-image
+      type: string
+    - default: .
+      description: The path to your source code
+      name: path-context
+      type: string
+    - default: Dockerfile
+      description: Path to the Dockerfile
+      name: dockerfile
+      type: string
+    - default: "false"
+      description: Force rebuild image
+      name: rebuild
+      type: string
+    - default: "false"
+      description: Skip checks against built image
+      name: skip-checks
+      type: string
+    - default: "false"
+      description: Execute the build with network isolation
+      name: hermetic
+      type: string
+    - default: ""
+      description: Build dependencies to be prefetched by Cachi2
+      name: prefetch-input
+      type: string
+    - default: "false"
+      description: Java build
+      name: java
+      type: string
+    - default: ""
+      description: Snyk Token Secret Name
+      name: snyk-secret
+      type: string
+    results:
+    - description: ""
+      name: IMAGE_URL
+      value: $(tasks.build-container.results.IMAGE_URL)
+    - description: ""
+      name: IMAGE_DIGEST
+      value: $(tasks.build-container.results.IMAGE_DIGEST)
+    - description: ""
+      name: CHAINS-GIT_URL
+      value: $(tasks.clone-repository.results.url)
+    - description: ""
+      name: CHAINS-GIT_COMMIT
+      value: $(tasks.clone-repository.results.commit)
+    - description: ""
+      name: JAVA_COMMUNITY_DEPENDENCIES
+      value: $(tasks.build-container.results.JAVA_COMMUNITY_DEPENDENCIES)
+    tasks:
+    - name: init
+      params:
+      - name: image-url
+        value: $(params.output-image)
+      - name: rebuild
+        value: $(params.rebuild)
+      - name: skip-checks
+        value: $(params.skip-checks)
+      - name: pipelinerun-name
+        value: $(context.pipelineRun.name)
+      - name: pipelinerun-uid
+        value: $(context.pipelineRun.uid)
+      taskRef:
+        bundle: quay.io/psturc/task-init:0.1@sha256:b4fe12f15f68cd2862a06e1c340121c039326ab1e8b15f6daedb1596f6732c7d
+        name: init
+    - name: clone-repository
+      params:
+      - name: url
+        value: $(params.git-url)
+      - name: revision
+        value: $(params.revision)
+      runAfter:
+      - init
+      taskRef:
+        bundle: quay.io/psturc/task-git-clone:0.1@sha256:9b51b0216baa67c82473a5e034c1df3ee955afef056f96a6202d282670ac32f0
+        name: git-clone
+      when:
+      - input: $(tasks.init.results.build)
+        operator: in
+        values:
+        - "true"
+      workspaces:
+      - name: output
+        workspace: workspace
+      - name: basic-auth
+        workspace: git-auth
+    - name: prefetch-dependencies
+      params:
+      - name: input
+        value: $(params.prefetch-input)
+      runAfter:
+      - clone-repository
+      taskRef:
+        bundle: quay.io/psturc/task-prefetch-dependencies:0.1@sha256:fe050371ac1b8a3821d893fde6fd4d63a38cde26beda5fb14e57ad7647f4b2ff
+        name: prefetch-dependencies
+      when:
+      - input: $(params.hermetic)
+        operator: in
+        values:
+        - "true"
+      workspaces:
+      - name: source
+        workspace: workspace
+    - name: build-container
+      params:
+      - name: IMAGE
+        value: $(params.output-image)
+      - name: DOCKERFILE
+        value: $(params.dockerfile)
+      - name: CONTEXT
+        value: $(params.path-context)
+      - name: DOCKER_AUTH
+        value: $(tasks.init.results.container-registry-secret)
+      - name: HERMETIC
+        value: $(params.hermetic)
+      - name: PREFETCH_INPUT
+        value: $(params.prefetch-input)
+      runAfter:
+      - prefetch-dependencies
+      taskRef:
+        bundle: quay.io/psturc/task-buildah:0.1@sha256:61abd53e8fb89dc3ef3f2d55f76141e7e4bc156643ef907394c0f880fccb2007
+        name: buildah
+      when:
+      - input: $(tasks.init.results.build)
+        operator: in
+        values:
+        - "true"
+      workspaces:
+      - name: source
+        workspace: workspace
+    - name: sanity-inspect-image
+      params:
+      - name: IMAGE_URL
+        value: $(tasks.build-container.results.IMAGE_URL)
+      - name: IMAGE_DIGEST
+        value: $(tasks.build-container.results.IMAGE_DIGEST)
+      - name: DOCKER_AUTH
+        value: $(tasks.init.results.container-registry-secret)
+      runAfter:
+      - build-container
+      taskRef:
+        bundle: quay.io/psturc/task-sanity-inspect-image:0.1@sha256:715259d3de4744e7e084cf2259920bd81b9b26d1da40ff2efbb86c97fc6e619b
+        name: sanity-inspect-image
+      when:
+      - input: $(params.skip-checks)
+        operator: in
+        values:
+        - "false"
+      workspaces:
+      - name: source
+        workspace: workspace
+    - name: sanity-label-check
+      runAfter:
+      - sanity-inspect-image
+      taskRef:
+        bundle: quay.io/psturc/task-sanity-label-check:0.1@sha256:c5b50ca39124befb3832fe49d5e5ce3641fcec308c081432c0ae58c5757fd147
+        name: sanity-label-check
+      when:
+      - input: $(params.skip-checks)
+        operator: in
+        values:
+        - "false"
+      workspaces:
+      - name: workspace
+        workspace: workspace
+    - name: sanity-optional-label-check
+      params:
+      - name: POLICY_NAMESPACE
+        value: optional_checks
+      runAfter:
+      - sanity-inspect-image
+      taskRef:
+        bundle: quay.io/psturc/task-sanity-label-check:0.1@sha256:c5b50ca39124befb3832fe49d5e5ce3641fcec308c081432c0ae58c5757fd147
+        name: sanity-label-check
+      when:
+      - input: $(params.skip-checks)
+        operator: in
+        values:
+        - "false"
+      workspaces:
+      - name: workspace
+        workspace: workspace
+    - name: deprecated-base-image-check
+      params:
+      - name: BASE_IMAGES_DIGESTS
+        value: $(tasks.build-container.results.BASE_IMAGES_DIGESTS)
+      taskRef:
+        bundle: quay.io/psturc/task-deprecated-image-check:0.1@sha256:e7372e2babf2ded78874159fc50e30c1b46af39c4679065f79388665870bd32e
+        name: deprecated-image-check
+      when:
+      - input: $(params.skip-checks)
+        operator: in
+        values:
+        - "false"
+      workspaces:
+      - name: sanity-ws
+        workspace: workspace
+    - name: clair-scan
+      params:
+      - name: image-digest
+        value: $(tasks.build-container.results.IMAGE_DIGEST)
+      - name: image-url
+        value: $(tasks.build-container.results.IMAGE_URL)
+      - name: docker-auth
+        value: $(tasks.init.results.container-registry-secret)
+      runAfter:
+      - build-container
+      taskRef:
+        bundle: quay.io/psturc/task-clair-scan:0.1@sha256:eab03b033b0fefc12395ea19f85168b5677679ff8b351e57b464a662ce75c093
+        name: clair-scan
+      when:
+      - input: $(params.skip-checks)
+        operator: in
+        values:
+        - "false"
+    - name: sast-snyk-check
+      params:
+      - name: SNYK_SECRET
+        value: $(params.snyk-secret)
+      runAfter:
+      - clone-repository
+      taskRef:
+        bundle: quay.io/psturc/task-sast-snyk-check:0.1@sha256:592a597c0040d5860dfc10c41b8be4f51672c58675012e38a3b969d0ae112731
+        name: sast-snyk-check
+      when:
+      - input: $(params.skip-checks)
+        operator: in
+        values:
+        - "false"
+      - input: $(params.snyk-secret)
+        operator: notin
+        values:
+        - ""
+      workspaces:
+      - name: workspace
+        workspace: workspace
+    - name: clamav-scan
+      params:
+      - name: image-digest
+        value: $(tasks.build-container.results.IMAGE_DIGEST)
+      - name: image-url
+        value: $(tasks.build-container.results.IMAGE_URL)
+      - name: docker-auth
+        value: $(tasks.init.results.container-registry-secret)
+      runAfter:
+      - build-container
+      taskRef:
+        bundle: quay.io/psturc/task-clamav-scan:0.1@sha256:ebe9f5c1fa8aff12a40d850502eaf13e1714f15fcb04b66bd71f911ee2fe840b
+        name: clamav-scan
+      when:
+      - input: $(params.skip-checks)
+        operator: in
+        values:
+        - "false"
+    - name: sbom-json-check
+      params:
+      - name: IMAGE_URL
+        value: $(tasks.build-container.results.IMAGE_URL)
+      - name: IMAGE_DIGEST
+        value: $(tasks.build-container.results.IMAGE_DIGEST)
+      runAfter:
+      - build-container
+      taskRef:
+        bundle: quay.io/psturc/task-sbom-json-check:0.1@sha256:dfc51e17895a0e3603ebcff63b393faf62c170b2194b5a8758f0d22ae10f8aea
+        name: sbom-json-check
+      when:
+      - input: $(params.skip-checks)
+        operator: in
+        values:
+        - "false"
+    workspaces:
+    - name: workspace
+    - name: git-auth
+      optional: true
+  workspaces:
+  - name: workspace
+    volumeClaimTemplate:
+      metadata:
+        creationTimestamp: null
+      spec:
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+      status: {}
+  - name: git-auth
+    secret:
+      secretName: '{{ git_auth_secret }}'
+status: {}
